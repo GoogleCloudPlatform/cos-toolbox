@@ -1,5 +1,5 @@
-# Start from debian:jessie-backports base.
-FROM debian:jessie-backports
+# Start from debian:stretch-backports base.
+FROM debian:stretch-backports
 
 # Prepare the image.
 ENV DEBIAN_FRONTEND noninteractive
