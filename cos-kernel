@@ -1,0 +1,635 @@
+#!/bin/bash
+
+#
+# This script fetches $FILES_TO_FETCH (kernel headers, source, toolchain,
+# ...)  of a specific COS release and installs them for compiling,
+# debugging, etc.  See usage() for details.
+#
+# This script is meant to run in COS toolbox or inside a cos-toolbox
+# container.
+#
+
+set -eu
+set -o pipefail
+
+# Program name and version.  Bump the version number if you change
+# this script.
+readonly PROG_NAME="$(basename "${0}")"
+readonly PROG_VERSION="1.0"
+
+# ANSI escape sequences for pretty printing.
+readonly RED_S="\033[00;31m"
+readonly BLUE_S="\033[00;34m"
+readonly PURPLE_S="\033[00;35m"
+readonly ANSI_E="\033[0m"
+
+# Build ID number is passed as an arg or read from $COS_OS_RELEASE.
+BUILD_ID=""
+readonly COS_OS_RELEASE="/media/root/etc/os-release"
+readonly COS_IMAGE_PROJECT="cos-cloud"
+
+# Kernel header, source, and toolchain tarballs in COS public GCS bucket.
+readonly COS_GCS_BUCKET="gs://cos-tools"
+readonly KERNEL_HEADERS="kernel-headers.tgz"
+readonly KERNEL_SRC="kernel-src.tar.gz"
+readonly TRUSTED_KEY="trusted_key.pem"
+readonly TOOLCHAIN="toolchain.tar.xz"
+readonly FILES_TO_FETCH=("${KERNEL_HEADERS}" "${KERNEL_SRC}" "${TRUSTED_KEY}" "${TOOLCHAIN}")
+
+# Installation directory names.
+readonly FETCHED_FILES_DIRNAME="fetched-files"
+readonly KERNEL_HEADERS_DIRNAME="cos-kernel-headers"
+readonly KERNEL_SRC_DIRNAME="cos-kernel-src"
+readonly TOOLCHAIN_DIRNAME="cos-toolchain"
+
+# Installation directory paths will be initialized after $INSTALL_DIR
+# and $BUILD_ID are set.
+FETCHED_FILES_DIR=""
+KERNEL_HEADERS_DIR=""
+KERNEL_SRC_DIR=""
+TOOLCHAIN_DIR=""
+
+# Packages required for extracting and compiling the kernel.
+readonly PACKAGE_LIST=("xz-utils" "make" "gcc" "python-minimal" "bc" "libelf-dev" "libssl-dev" "crash")
+
+# Temporary files created for the list subcommand.
+readonly TMP_IMAGE_LIST="/tmp/image_list"
+readonly TMP_BUILD_ID_LIST="/tmp/build_id_list"
+readonly TMP_BUILD_ID_FILES="/tmp/build_id_files"
+
+SUBCOMMAND=""
+
+# Set the defaults that can be changed by command line flags.
+HELP=""			# -h
+INSTALL_DIR="${HOME}"	# -i
+ECHO=":"		# -v
+GLOBAL_OPTIONS="$(cat <<EOF
+	-h, --help	help message
+	-i, --instdir	install directory (default \$HOME: $HOME)
+	-v, --verbose	verbose mode
+EOF
+)"
+
+ALL=""			# -a
+LIST_OPTIONS="$(cat <<EOF
+	-h, --help	help message
+	-a, --all	include deprecated builds
+EOF
+)"
+
+# shellcheck disable=SC2034
+EXTRACT="yes"		# -x
+FETCH_OPTIONS="$(cat <<EOF
+	-h, --help	help message
+	-x, --no-xtract	do not extract files
+EOF
+)"
+
+# shellcheck disable=SC2034
+KERNEL_CONFIG=""	# -c
+PRINT_CMD=""		# -p
+BUILD_OPTIONS="$(cat <<EOF
+	-h, --help	help message
+	-c, --kconf	path to kernel configuration file
+	-p, --print	print commands to build the kernel, but do not execute
+EOF
+)"
+
+# shellcheck disable=SC2034
+REMOVE_OPTIONS="$(cat <<EOF
+	-h, --help	help message
+	-a, --all	remove all fetched files
+EOF
+)"
+
+
+usage() {
+	local -r exit_code="${1}"
+
+	cat <<EOF
+${PROG_NAME} v${PROG_VERSION}
+
+Usage:
+	${PROG_NAME} [<global-options>] <subcommand> [<subcommand-options>] [<build-id>]
+
+Subcommmands:
+	list		list available builds
+	fetch		fetch kernel headers, source, and toolchain tarballs
+	build		build kernel (implies fetch)
+	remove		remove fetched and extracted files
+	help		print help message
+
+Global options:
+${GLOBAL_OPTIONS}
+
+list options:
+${LIST_OPTIONS}
+
+fetch options:
+${FETCH_OPTIONS}
+
+build options:
+${BUILD_OPTIONS}
+
+remove options:
+${REMOVE_OPTIONS}
+
+Environment:
+	HOME		default installation directory
+EOF
+	exit "${exit_code}"
+}
+
+
+main() {
+	local options
+
+	parse_args "${@}"
+
+	# Global help message.
+	if [[ -z "${SUBCOMMAND}" || "${SUBCOMMAND}" == "help" ]]; then
+		usage 0
+	fi
+
+	# Subcommand-specific help message.
+	if [[ -n "${HELP}" ]]; then
+		echo "${SUBCOMMAND}" specific options:
+		options="${SUBCOMMAND^^}_OPTIONS"
+		echo "${!options}"
+		exit 0
+	fi
+
+	# No need to initialize if we're listing available releases.
+	if [[ "${SUBCOMMAND}" != "list" ]]; then
+		initialize
+	fi
+
+	case "${SUBCOMMAND}" in
+	"list")		subcmd_list;;
+	"fetch")	subcmd_fetch;;
+	"build")	subcmd_build;;
+	"remove")	subcmd_remove;;
+	*)		fata internal error processing "${SUBCOMMAND}"
+	esac
+}
+
+
+parse_args() {
+	local args
+
+	if ! args=$(getopt \
+			--options "ac:hi:pvx" \
+			--longoptions "all config: help instdir: print verbose no-xtract" \
+			-- "$@"); then
+		exit 1
+	fi
+	eval set -- "${args}"
+
+	while [[ "${#}" -gt 0 ]]; do
+		case "${1}" in
+		-a|--all)
+			ALL="yes";;
+		-c|--kconf)
+			shift
+			KERNEL_CONFIG="${1}";;
+		-h|--help)
+			HELP="yes";;
+		-i|--instdir)
+			shift
+			INSTALL_DIR="${1}";;
+		-p|--print)
+			PRINT_CMD="echo";;
+		-v|--verbose)
+			ECHO="info";;
+		-x|--no-xtract)
+			EXTRACT="no";;
+		--)
+			;;
+		*)
+			if [[ ${1} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+				BUILD_ID="${1}"
+				shift
+				continue
+			fi
+			if [[ -n "${SUBCOMMAND}" ]]; then
+				fatal specify only one subcommand
+			fi
+			case "${1}" in
+			"list")		SUBCOMMAND="${1}";;
+			"fetch")	SUBCOMMAND="${1}";;
+			"build")	SUBCOMMAND="${1}";;
+			"remove")	SUBCOMMAND="${1}";;
+			"help")		SUBCOMMAND="${1}";;
+			"--")		;;
+			*)		fatal "${1}": invalid build id
+			esac
+		esac
+		shift
+	done
+
+	if [[ -z "${INSTALL_DIR}" ]]; then
+		fatal install directory not specified
+	fi
+}
+
+
+initialize() {
+	if [[ "${SUBCOMMAND}" == "remove" && -n "${ALL}" ]]; then
+		return
+	fi
+
+	# If build ID is not provided as an argument, we assume we're
+	# running on COS and the user wants the current build ID.
+	if [[ -z "${BUILD_ID}" ]]; then
+		if [[ ! -f "${COS_OS_RELEASE}" ]]; then
+			fatal "${COS_OS_RELEASE}" does not exist and build ID not specified
+		fi
+		# shellcheck disable=SC1090
+		source "${COS_OS_RELEASE}"
+	fi
+
+	if [[ ! ${BUILD_ID} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		error "${BUILD_ID}": invalid build id
+		return 1
+	fi
+
+	FETCHED_FILES_DIR="${INSTALL_DIR}/${FETCHED_FILES_DIRNAME}/${BUILD_ID}"
+	KERNEL_HEADERS_DIR="${INSTALL_DIR}/${KERNEL_HEADERS_DIRNAME}/${BUILD_ID}"
+	KERNEL_SRC_DIR="${INSTALL_DIR}/${KERNEL_SRC_DIRNAME}/${BUILD_ID}"
+	TOOLCHAIN_DIR="${INSTALL_DIR}/${TOOLCHAIN_DIRNAME}/${BUILD_ID}"
+
+	info INSTALL_DIR="${INSTALL_DIR}"
+	info BUILD_ID="${BUILD_ID}"
+	echo
+	"${ECHO}" FETCHED_FILES_DIR="${FETCHED_FILES_DIR}"
+	"${ECHO}" KERNEL_HEADERS_DIR="${KERNEL_HEADERS_DIR}"
+	"${ECHO}" KERNEL_SRC_DIR="${KERNEL_SRC_DIR}"
+	"${ECHO}" TOOLCHAIN_DIR="${TOOLCHAIN_DIR}"
+	"${ECHO}"
+}
+
+
+subcmd_list() {
+	local header
+	local n
+	local build_id
+	local all_lines
+	local line
+
+	# If we generated the list of images within the past hour, use it.
+        if [[ ! -s "${TMP_IMAGE_LIST}" || -z "$(find "${TMP_IMAGE_LIST}" -cmin -60)" ]]; then
+		info getting the list of images from "${COS_IMAGE_PROJECT}"
+		list_cos_images > "${TMP_IMAGE_LIST}"
+	fi
+
+	# If we generated the list of build IDs within the past hour, use it.
+        if [[ ! -s "${TMP_BUILD_ID_FILES}" || -z "$(find "${TMP_BUILD_ID_FILES}" -cmin -60)" ]]; then
+		info getting the list of builds from "${COS_GCS_BUCKET}"
+		gsutil ls -r "${COS_GCS_BUCKET}" > "${TMP_BUILD_ID_FILES}"
+	fi
+
+	# Get and sort the list of build IDs in $COS_GCS_BUCKET.
+	if [[ -n "${BUILD_ID}" ]]; then
+		echo "${BUILD_ID}" > "${TMP_BUILD_ID_LIST}"
+		# The $BUILD_ID may be deprecated or obsolete, but
+		# becaue it was specified on the command line, we
+		# still want to print it.
+		ALL="yes"
+	else
+		grep '^gs://.*:$' "${TMP_BUILD_ID_FILES}" | \
+			grep -E '[0-9]+\.[0-9]+\.[0-9]+' | \
+			sed -e "s;${COS_GCS_BUCKET}/;;" -e "s;/:;;" | \
+			sort -V > "${TMP_BUILD_ID_LIST}"
+	fi
+
+	# Build and print the header.
+	header="BUILD_ID       MS FAMILY"
+	if [[ -n "${ALL}" ]]; then
+		header="${header} STAT"
+	fi
+	header="${header}   HDR SRC KEY TLC"
+	echo "${header}"
+
+	n=0
+	while read -r build_id; do
+		# Although we no longer create releases with the exact
+		# same build ID in different image families, there are
+		# still older releases like cos-65-10323-104-0 and
+		# cos-stable-65-10323-104-0 that do have the same
+		# build ID.  So, grep can return multiple lines.
+		all_lines=("$(grep "${build_id//./-}" "${TMP_IMAGE_LIST}")")
+		while read -r line; do
+			if [[ "${line}" == *"DEPRECATED"* && -z "${ALL}" ]]; then
+				continue
+			fi
+			milestone_family=($(get_milestone_family "${line}"))
+			printf "%-14s %2s %6s" "${build_id}" "${milestone_family[0]}" "${milestone_family[1]}"
+			if [[ -n "${ALL}" ]]; then
+				if [[ "${line}" == *"DEPRECATED"* ]]; then
+					echo -n "  dep"
+				elif [[ "${line}" == *"OBSOLETE"* ]]; then
+					echo -n "  obs"
+				else
+					echo -n "     "
+				fi
+			fi
+			echo -n "   "
+			for f in "${FILES_TO_FETCH[@]}"; do
+				if grep -q "/${build_id}/${f}\$" "${TMP_BUILD_ID_FILES}"; then
+					echo -n "+++ "
+				else
+					echo -n "--- "
+				fi
+			done
+			echo
+			n=$((n + 1))
+			if [[ "${n}" -gt 25 ]]; then
+				echo
+				echo "${header}"
+				n=0
+			fi
+		done <<< "${all_lines[@]}"
+	done < "${TMP_BUILD_ID_LIST}"
+}
+
+
+subcmd_fetch() {
+	local f
+	local md5	# md5sum checksum file
+
+	mkdir -p "${FETCHED_FILES_DIR}"
+	for f in "${FILES_TO_FETCH[@]}"; do
+		if [[ -s "${FETCHED_FILES_DIR}/${f}" ]]; then
+			"${ECHO}" "${FETCHED_FILES_DIR}/${f}" already exists
+		else
+			"${ECHO}" fetching "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+			if ! fetch_file "${COS_GCS_BUCKET}/${BUILD_ID}/${f}" "${FETCHED_FILES_DIR}/${f}"; then
+				# Old builds do not have toolchain.
+				# Also, trusted key was introduced in R73-11391.0.0.
+				if [[ "${f}" != "${TOOLCHAIN}" && "${f}" != "${TRUSTED_KEY}" ]]; then
+					fatal could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+				fi
+				if [[ "${f}" == "${TRUSTED_KEY}" && "${BUILD_ID/.*/}" -gt "11391" ]]; then
+					fatal could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+				fi
+			fi
+			rm -f "${FETCHED_FILES_DIR}/${f}.verified" "${FETCHED_FILES_DIR}/${f}.installed"
+		fi
+
+		md5="${f}.md5"
+		if [[ -s "${FETCHED_FILES_DIR}/${md5}" ]]; then
+			"${ECHO}" "${FETCHED_FILES_DIR}/${md5}" already exists
+		else
+			"${ECHO}" fetching "${COS_GCS_BUCKET}/${BUILD_ID}/${md5}"
+			# The md5 file is missing for old builds, so we tolerate failure.
+			if ! fetch_file "${COS_GCS_BUCKET}/${BUILD_ID}/${md5}" "${FETCHED_FILES_DIR}/${md5}"; then
+				# This error is not fatal because older tarballs do not have
+				# md5sum checksum files.
+				warn could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${md5}"
+				rm -f "${FETCHED_FILES_DIR}/${md5}"
+			fi
+		fi
+	done
+
+	verify_fetched_files
+	if [[ "${EXTRACT}" == "yes" ]]; then
+		install_packages
+		extract_files
+	fi
+}
+
+
+subcmd_build() {
+	local path
+
+	subcmd_fetch
+
+	path="$(realpath "${TOOLCHAIN_DIR}/bin")"
+	${PRINT_CMD} export PATH="${path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/google-cloud-sdk/bin"
+	${PRINT_CMD} cd "${KERNEL_SRC_DIR}"
+	${PRINT_CMD} make -j $(($(nproc) * 2)) CROSS_COMPILE=x86_64-cros-linux-gnu-
+}
+
+
+subcmd_remove() {
+	local f
+
+	if [[ -n "${ALL}" ]]; then
+		for f in "${FETCHED_FILES_DIRNAME}" "${KERNEL_HEADERS_DIRNAME}" "${KERNEL_SRC_DIRNAME}" "${TOOLCHAIN_DIRNAME}"; do
+			info removing "${INSTALL_DIR}/${f}"
+			# shellcheck disable=SC2115
+			rm -rf "${INSTALL_DIR}/${f}"
+		done
+		return
+	fi
+
+	for f in "${FETCHED_FILES_DIR}" "${KERNEL_HEADERS_DIR}" "${KERNEL_SRC_DIR}" "${TOOLCHAIN_DIR}"; do
+		if [[ -n "${f}" ]]; then
+			info removing "${f}"
+			rm -rf "${f}"
+		fi
+	done
+
+	for f in "${TMP_IMAGE_LIST}" "${TMP_BUILD_ID_LIST}" "${TMP_BUILD_ID_FILES}"; do
+		if [[ -f "${f}" ]]; then
+			info removing "${f}"
+			rm -f "${f}"
+		fi
+	done
+}
+
+
+list_cos_images() {
+	gcloud compute images list --project "${COS_IMAGE_PROJECT}" --no-standard-images --show-deprecated
+}
+
+
+get_milestone_family() {
+	local line="${1}"
+	local milestone
+	local family
+
+	#cos-65-10323-104-0         cos-cloud  cos-65-lts  DEPRECATED  READY
+	#cos-dev-72-11190-0-0       cos-cloud  cos-dev     DEPRECATED  READY
+	if [[ "${line}" =~ ^cos-[0-9][0-9]* ]]; then
+		# shellcheck disable=SC2001
+		milestone="$(echo "${line}" | sed -e 's/cos-\(.*\)-\(.*\)-\(.*\)-\([0-9][0-9]*\)\(  *cos-cloud.*\)/\1/')"
+		family="lts"
+	else
+		# shellcheck disable=SC2001
+		milestone="$(echo "${line}" | sed -e 's/cos-\(.*\)-\(.*\)-\(.*\)-\(.*\)-\([0-9][0-9]*\)\(  *cos-cloud.*\)/\2/')"
+		# shellcheck disable=SC2001
+		family="$(echo "${line}" | sed -e 's/cos-\(.*\)-\(.*\)-\(.*\)-\(.*\)-\([0-9][0-9]*\)\(  *cos-cloud.*\)/\1/')"
+	fi
+	echo "${milestone}" "${family}"
+}
+
+
+fetch_file() {
+	local src="${1}"
+	local dst="${2}"
+
+	if ! gsutil cp "${src}" "${dst}" 2>/dev/null; then
+		return 1
+	fi
+
+	if ! test -s "${dst}"; then
+		return 1
+	fi
+}
+
+
+verify_fetched_files() {
+	local f
+	local checksum
+
+	for f in "${FILES_TO_FETCH[@]}"; do
+		f="${FETCHED_FILES_DIR}/${f}"
+		if [[ ! -f "${f}.md5" ]]; then
+			warn no "${f}.md5", skipping verification
+			continue
+		fi
+		if [[ -f "${f}.verified" ]]; then
+			"${ECHO}" "${f}": already verified
+			continue
+		fi
+		checksum="$(md5sum "${f}" | awk '{ print $1 }')"
+		if [[ "${checksum}" == "$(cat "${f}.md5")" ]]; then
+			"${ECHO}" verified "${f}"
+			touch "${f}.verified"
+		else
+			fatal "${f}" md5sum mismatch: expected "$(cat "${f}.md5")", got "${checksum}"
+		fi
+	done
+}
+
+
+install_packages() {
+	local p
+	local packages=()
+	local do_sudo
+
+	info verifying required packages are installed
+
+	if [[ $(id -u) != 0 ]]; then
+		do_sudo="sudo -E"
+	else
+		do_sudo=""
+	fi
+	DEBIAN_FRONTEND=noninteractive $do_sudo apt-get update -qq
+
+	for p in "${PACKAGE_LIST[@]}"; do
+		if ! dpkg-query -s "${p}" > /dev/null 2>&1; then
+			packages+=("${p}")
+		fi
+	done
+
+	if [[ ${#packages[@]} -gt 0 ]]; then
+		info installing packages required to extract and compile the kernel: "${packages[@]}"
+		DEBIAN_FRONTEND=noninteractive $do_sudo apt-get install -y "${packages[@]}" > /dev/null
+	fi
+}
+
+
+extract_files() {
+	local f
+	local installed="no"
+	local kernel_config="${KERNEL_SRC_DIR}/.config"
+
+	if [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN}.installed" ]]; then
+		"${ECHO}" toolchain already installed
+	else
+		info installing toolchain
+		mkdir -p "${TOOLCHAIN_DIR}"
+		tar -C "${TOOLCHAIN_DIR}" -xf "${FETCHED_FILES_DIR}/${TOOLCHAIN}"
+		touch "${FETCHED_FILES_DIR}/${TOOLCHAIN}.installed"
+		installed="yes"
+	fi
+
+	if [[ -f "${FETCHED_FILES_DIR}/${KERNEL_HEADERS}.installed" ]]; then
+		"${ECHO}" kernel headers already installed
+	else
+		info installing kernel headers
+		mkdir -p "${KERNEL_HEADERS_DIR}"
+		tar -C "${KERNEL_HEADERS_DIR}" -xf "${FETCHED_FILES_DIR}/${KERNEL_HEADERS}"
+		touch "${FETCHED_FILES_DIR}/${KERNEL_HEADERS}.installed"
+		installed="yes"
+	fi
+
+	if [[ -f "${FETCHED_FILES_DIR}/${KERNEL_SRC}.installed" ]]; then
+		"${ECHO}" kernel source already installed
+	else
+		info installing kernel source
+		mkdir -p "${KERNEL_SRC_DIR}"
+		tar -C "${KERNEL_SRC_DIR}" -xf "${FETCHED_FILES_DIR}/${KERNEL_SRC}"
+		(cd "$(dirname "${KERNEL_SRC_DIR}")" && rm -f kernel && ln -s "$(basename "${KERNEL_SRC_DIR}")" kernel)
+		touch "${FETCHED_FILES_DIR}/${KERNEL_SRC}.installed"
+		installed="yes"
+	fi
+
+	if [[ -n "${KERNEL_CONFIG}" ]]; then
+		info creating kernel config file from "${KERNEL_CONFIG}"
+		if [[ "${KERNEL_CONFIG}" == "/proc/config.gz" ]]; then
+			zcat "${KERNEL_CONFIG}" > "${kernel_config}"
+		else
+			cp -a "${KERNEL_CONFIG}" "${KERNEL_SRC_DIR}"
+		fi
+		installed="yes"
+	else
+		if [[ -s "${kernel_config}" ]]; then
+			"${ECHO}" "${kernel_config}" already exists
+		else
+			info copying kernel config from kernel headers
+			f="$(eval echo "${KERNEL_HEADERS_DIR}"/usr/src/linux-headers-*/.config)"
+			if [[ ! -f "${f}" ]]; then
+				fatal "${f}" does not exist
+			fi
+			cp -a "${f}" "${kernel_config}"
+			installed="yes"
+		fi
+	fi
+
+	# See if we have to copy trusted key.
+	output="$(grep -w "CONFIG_SYSTEM_TRUSTED_KEYS" "${kernel_config}")" || true
+	if echo "${output}" | grep -qw "certs/${TRUSTED_KEY}"; then
+		if [[ ! -f "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}" ]]; then
+			info copying trusted key to "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
+			cp -a "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
+			installed="yes"
+		fi
+	fi
+
+	if [[ "${installed}" == "yes" ]]; then
+		echo
+	fi
+}
+
+
+info() {
+	if [[ -n "${*}" ]]; then
+		echo -e "${BLUE_S}INFO: ${*}${ANSI_E}" >&2
+	else
+		echo
+	fi
+}
+
+
+warn() {
+	if [[ "${ECHO}" != ":" ]]; then
+		echo -e "${PURPLE_S}WARNING: ${*}${ANSI_E}" >&2
+	fi
+}
+
+
+error() {
+	echo -e "${RED_S}ERROR: ${*}${ANSI_E}" >&2
+}
+
+
+fatal() {
+	error "${@}"
+	exit 1
+}
+
+
+main "${@}"
