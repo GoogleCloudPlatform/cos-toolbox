@@ -324,7 +324,7 @@ subcmd_list() {
 		# build ID.  So, grep can return multiple lines.
 		all_lines=("$(grep "${build_id//./-}" "${TMP_IMAGE_LIST}")")
 		while read -r line; do
-			if [[ "${line}" == *"DEPRECATED"* && -z "${ALL}" ]]; then
+			if [[ ("${line}" == *"DEPRECATED"* || "${line}" == *"OBSOLETE"*) && -z "${ALL}" ]]; then
 				continue
 			fi
 			milestone_family=($(get_milestone_family "${line}"))
