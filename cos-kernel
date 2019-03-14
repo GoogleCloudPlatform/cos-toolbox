@@ -49,9 +49,6 @@ KERNEL_HEADERS_DIR=""
 KERNEL_SRC_DIR=""
 TOOLCHAIN_DIR=""
 
-# Packages required for extracting and compiling the kernel.
-readonly PACKAGE_LIST=("xz-utils" "make" "gcc" "python-minimal" "bc" "libelf-dev" "libssl-dev" "crash")
-
 # Temporary files created for the list subcommand.
 readonly TMP_IMAGE_LIST="/tmp/image_list"
 readonly TMP_BUILD_ID_LIST="/tmp/build_id_list"
@@ -397,7 +394,6 @@ subcmd_fetch() {
 
 	verify_fetched_files
 	if [[ "${EXTRACT}" == "yes" ]]; then
-		install_packages
 		extract_files
 	fi
 }
@@ -505,33 +501,6 @@ verify_fetched_files() {
 			fatal "${f}" md5sum mismatch: expected "$(cat "${f}.md5")", got "${checksum}"
 		fi
 	done
-}
-
-
-install_packages() {
-	local p
-	local packages=()
-	local do_sudo
-
-	info verifying required packages are installed
-
-	if [[ $(id -u) != 0 ]]; then
-		do_sudo="sudo -E"
-	else
-		do_sudo=""
-	fi
-	DEBIAN_FRONTEND=noninteractive $do_sudo apt-get update -qq
-
-	for p in "${PACKAGE_LIST[@]}"; do
-		if ! dpkg-query -s "${p}" > /dev/null 2>&1; then
-			packages+=("${p}")
-		fi
-	done
-
-	if [[ ${#packages[@]} -gt 0 ]]; then
-		info installing packages required to extract and compile the kernel: "${packages[@]}"
-		DEBIAN_FRONTEND=noninteractive $do_sudo apt-get install -y "${packages[@]}" > /dev/null
-	fi
 }
 
 
