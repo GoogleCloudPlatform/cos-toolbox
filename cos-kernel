@@ -88,10 +88,12 @@ EOF
 # shellcheck disable=SC2034
 KERNEL_CONFIG=""	# -c
 PRINT_CMD=""		# -p
+MAKE_VERBOSE=""		# -V
 BUILD_OPTIONS="$(cat <<EOF
 	-h, --help	help message
 	-c, --kconf	path to kernel configuration file
 	-p, --print	print commands to build the kernel, but do not execute
+	-V		enable make's verbose mode
 EOF
 )"
 
@@ -169,7 +171,7 @@ main() {
 	"fetch")	subcmd_fetch;;
 	"build")	subcmd_build;;
 	"remove")	subcmd_remove;;
-	*)		fata internal error processing "${SUBCOMMAND}"
+	*)		fatal internal error processing "${SUBCOMMAND}"
 	esac
 }
 
@@ -178,9 +180,10 @@ parse_args() {
 	local args
 
 	if ! args=$(getopt \
-			--options "ac:hi:pvx" \
+			--options "ac:hi:pvVx" \
 			--longoptions "all config: help instdir: print verbose no-xtract" \
 			-- "$@"); then
+		# getopt has printed an appropriate error message.
 		exit 1
 	fi
 	eval set -- "${args}"
@@ -201,6 +204,8 @@ parse_args() {
 			PRINT_CMD="echo";;
 		-v|--verbose)
 			ECHO="info";;
+		-V)
+			MAKE_VERBOSE="V=1";;
 		-x|--no-xtract)
 			EXTRACT="no";;
 		--)
@@ -364,14 +369,13 @@ subcmd_fetch() {
 		else
 			"${ECHO}" fetching "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
 			if ! fetch_file "${COS_GCS_BUCKET}/${BUILD_ID}/${f}" "${FETCHED_FILES_DIR}/${f}"; then
-				# Old builds do not have toolchain.
-				# Also, trusted key was introduced in R73-11391.0.0.
+				# Failing to fetch toolchain or trusted key is not fatal because older builds
+				# do not have them.
 				if [[ "${f}" != "${TOOLCHAIN}" && "${f}" != "${TRUSTED_KEY}" ]]; then
 					fatal could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
 				fi
-				if [[ "${f}" == "${TRUSTED_KEY}" && "${BUILD_ID/.*/}" -gt "11391" ]]; then
-					fatal could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
-				fi
+				warn could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+				rm -f "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
 			fi
 			rm -f "${FETCHED_FILES_DIR}/${f}.verified" "${FETCHED_FILES_DIR}/${f}.installed"
 		fi
@@ -407,7 +411,7 @@ subcmd_build() {
 	path="$(realpath "${TOOLCHAIN_DIR}/bin")"
 	${PRINT_CMD} export PATH="${path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/google-cloud-sdk/bin"
 	${PRINT_CMD} cd "${KERNEL_SRC_DIR}"
-	${PRINT_CMD} make -j $(($(nproc) * 2)) CROSS_COMPILE=x86_64-cros-linux-gnu-
+	${PRINT_CMD} make ${MAKE_VERBOSE} -j $(($(nproc) * 2)) CROSS_COMPILE=x86_64-cros-linux-gnu-
 }
 
 
@@ -589,13 +593,21 @@ extract_files() {
 		fi
 	fi
 
-	# See if we have to copy trusted key.
+	# Check if we fetched a trusted key and need to copy it to kernel source directory.
 	output="$(grep -w "CONFIG_SYSTEM_TRUSTED_KEYS" "${kernel_config}")" || true
 	if echo "${output}" | grep -qw "certs/${TRUSTED_KEY}"; then
-		if [[ ! -f "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}" ]]; then
-			info copying trusted key to "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
-			cp -a "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
-			installed="yes"
+		if [[ -f "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" ]]; then
+			if [[ ! -f "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}" ]]; then
+				info copying trusted key to "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
+				cp -a "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
+				installed="yes"
+			else
+				"${ECHO}" trusted key "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}" already exists
+			fi
+		else
+			warn modifying trusted key kernel config option because we could not fetch the trusted key
+			diff "${kernel_config}" "${kernel_config}.bak" || true
+			sed -i.bak -e 's/CONFIG_SYSTEM_TRUSTED_KEYS=.*/CONFIG_SYSTEM_TRUSTED_KEYS=""/' "${kernel_config}"
 		fi
 	fi
 
