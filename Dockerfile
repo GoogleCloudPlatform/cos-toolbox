@@ -22,6 +22,7 @@ RUN apt-get install -u -qq vim \
     ebtables \
     && apt-get clean
 
+COPY cos-kernel /usr/local/bin
 
 RUN mkdir /.ssh && echo "PATH=\$PATH:/google-cloud-sdk/bin" > /etc/profile.d/gcloud_path.sh
 ENV PATH /google-cloud-sdk/bin:$PATH
