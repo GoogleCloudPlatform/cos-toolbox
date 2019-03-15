@@ -22,6 +22,11 @@ RUN apt-get install -u -qq vim \
     ebtables \
     && apt-get clean
 
+# These packages are required or extracting source tarballs and building the kernel.
+RUN apt-get update && \
+    apt-get install -u -qq \
+        xz-utils make gcc python-minimal bc libelf-dev libssl-dev crash && \
+    apt-get clean
 COPY cos-kernel /usr/local/bin
 
 RUN mkdir /.ssh && echo "PATH=\$PATH:/google-cloud-sdk/bin" > /etc/profile.d/gcloud_path.sh
