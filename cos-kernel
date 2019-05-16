@@ -15,7 +15,7 @@ set -o pipefail
 # Program name and version.  Bump the version number if you change
 # this script.
 readonly PROG_NAME="$(basename "${0}")"
-readonly PROG_VERSION="1.0"
+readonly PROG_VERSION="1.1"
 
 # ANSI escape sequences for pretty printing.
 readonly RED_S="\033[00;31m"
