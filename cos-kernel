@@ -15,7 +15,7 @@ set -o pipefail
 # Program name and version.  Bump the version number if you change
 # this script.
 readonly PROG_NAME="$(basename "${0}")"
-readonly PROG_VERSION="1.1"
+readonly PROG_VERSION="1.2"
 
 # ANSI escape sequences for pretty printing.
 readonly RED_S="\033[00;31m"
@@ -28,21 +28,21 @@ BUILD_ID=""
 readonly COS_OS_RELEASE="/media/root/etc/os-release"
 readonly COS_IMAGE_PROJECT="cos-cloud"
 
-# Kernel header, source, toolchain tarballs and toolchain_info file in COS public GCS bucket.
+# Kernel header, source, toolchain tarballs and toolchain_env file in COS public GCS bucket.
 readonly COS_GCS_BUCKET="gs://cos-tools"
 readonly KERNEL_HEADERS="kernel-headers.tgz"
 readonly KERNEL_SRC="kernel-src.tar.gz"
 readonly TRUSTED_KEY="trusted_key.pem"
 readonly TOOLCHAIN="toolchain.tar.xz"
-readonly TOOLCHAIN_INFO_FILENAME="toolchain_info"
-readonly FILES_TO_FETCH=("${KERNEL_HEADERS}" "${KERNEL_SRC}" "${TRUSTED_KEY}" "${TOOLCHAIN}" "${TOOLCHAIN_INFO_FILENAME}")
+readonly TOOLCHAIN_ENV_FILENAME="toolchain_env"
+readonly FILES_TO_FETCH=("${KERNEL_HEADERS}" "${KERNEL_SRC}" "${TRUSTED_KEY}" "${TOOLCHAIN}" "${TOOLCHAIN_ENV_FILENAME}")
 
 # Installation directory names.
 readonly FETCHED_FILES_DIRNAME="fetched-files"
 readonly KERNEL_HEADERS_DIRNAME="cos-kernel-headers"
 readonly KERNEL_SRC_DIRNAME="cos-kernel-src"
 readonly TOOLCHAIN_DIRNAME="cos-toolchain"
-readonly TOOLCHAIN_INFO_DIRNAME="cos-toolchain-info"
+readonly TOOLCHAIN_ENV_DIRNAME="cos-toolchain-env"
 
 # Installation directory paths will be initialized after $INSTALL_DIR
 # and $BUILD_ID are set.
@@ -50,7 +50,7 @@ FETCHED_FILES_DIR=""
 KERNEL_HEADERS_DIR=""
 KERNEL_SRC_DIR=""
 TOOLCHAIN_DIR=""
-TOOLCHAIN_INFO_DIR=""
+TOOLCHAIN_ENV_DIR=""
 
 # Temporary files created for the list subcommand.
 readonly TMP_IMAGE_LIST="/tmp/image_list"
@@ -266,7 +266,7 @@ initialize() {
 	KERNEL_HEADERS_DIR="${INSTALL_DIR}/${KERNEL_HEADERS_DIRNAME}/${BUILD_ID}"
 	KERNEL_SRC_DIR="${INSTALL_DIR}/${KERNEL_SRC_DIRNAME}/${BUILD_ID}"
 	TOOLCHAIN_DIR="${INSTALL_DIR}/${TOOLCHAIN_DIRNAME}/${BUILD_ID}"
-	TOOLCHAIN_INFO_DIR="${INSTALL_DIR}/${TOOLCHAIN_INFO_DIRNAME}/${BUILD_ID}"
+	TOOLCHAIN_ENV_DIR="${INSTALL_DIR}/${TOOLCHAIN_ENV_DIRNAME}/${BUILD_ID}"
 
 	info INSTALL_DIR="${INSTALL_DIR}"
 	info BUILD_ID="${BUILD_ID}"
@@ -275,7 +275,7 @@ initialize() {
 	"${ECHO}" KERNEL_HEADERS_DIR="${KERNEL_HEADERS_DIR}"
 	"${ECHO}" KERNEL_SRC_DIR="${KERNEL_SRC_DIR}"
 	"${ECHO}" TOOLCHAIN_DIR="${TOOLCHAIN_DIR}"
-	"${ECHO}" TOOLCHAIN_INFO_DIR="${TOOLCHAIN_INFO_DIR}"
+	"${ECHO}" TOOLCHAIN_ENV_DIR="${TOOLCHAIN_ENV_DIR}"
 	"${ECHO}"
 }
 
@@ -375,9 +375,9 @@ subcmd_fetch() {
 		else
 			"${ECHO}" fetching "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
 			if ! fetch_file "${COS_GCS_BUCKET}/${BUILD_ID}/${f}" "${FETCHED_FILES_DIR}/${f}"; then
-				# Failing to fetch toolchain, toolchain_info or trusted key is not fatal
+				# Failing to fetch toolchain, toolchain_env or trusted key is not fatal
 				# because older build do not have them.
-				if [[ "${f}" != "${TOOLCHAIN}" && "${f}" != "${TRUSTED_KEY}" && "${f}" != "${TOOLCHAIN_INFO_FILENAME}" ]]; then
+				if [[ "${f}" != "${TOOLCHAIN}" && "${f}" != "${TRUSTED_KEY}" && "${f}" != "${TOOLCHAIN_ENV_FILENAME}" ]]; then
 					fatal could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
 				fi
 				warn could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
@@ -421,7 +421,7 @@ subcmd_remove() {
 	local f
 
 	if [[ -n "${ALL}" ]]; then
-		for f in "${FETCHED_FILES_DIRNAME}" "${KERNEL_HEADERS_DIRNAME}" "${KERNEL_SRC_DIRNAME}" "${TOOLCHAIN_DIRNAME}" "${TOOLCHAIN_INFO_DIRNAME}"; do
+		for f in "${FETCHED_FILES_DIRNAME}" "${KERNEL_HEADERS_DIRNAME}" "${KERNEL_SRC_DIRNAME}" "${TOOLCHAIN_DIRNAME}" "${TOOLCHAIN_ENV_DIRNAME}"; do
 			info removing "${INSTALL_DIR}/${f}"
 			# shellcheck disable=SC2115
 			rm -rf "${INSTALL_DIR}/${f}"
@@ -429,7 +429,7 @@ subcmd_remove() {
 		return
 	fi
 
-	for f in "${FETCHED_FILES_DIR}" "${KERNEL_HEADERS_DIR}" "${KERNEL_SRC_DIR}" "${TOOLCHAIN_DIR}" "${TOOLCHAIN_INFO_DIR}"; do
+	for f in "${FETCHED_FILES_DIR}" "${KERNEL_HEADERS_DIR}" "${KERNEL_SRC_DIR}" "${TOOLCHAIN_DIR}" "${TOOLCHAIN_ENV_DIR}"; do
 		if [[ -n "${f}" ]]; then
 			info removing "${f}"
 			rm -rf "${f}"
@@ -525,14 +525,14 @@ extract_files() {
 		installed="yes"
 	fi
 
-	if [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN_INFO_FILENAME}.installed" ]]; then
-		"${ECHO}" toolchain_info already installed
-	elif [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN_INFO_FILENAME}" ]]; then
-		info installing toolchain_info
+	if [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}.installed" ]]; then
+		"${ECHO}" toolchain_env already installed
+	elif [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}" ]]; then
+		info installing toolchain_env
 
-		mkdir -p "${TOOLCHAIN_INFO_DIR}"
-		cp "${FETCHED_FILES_DIR}/${TOOLCHAIN_INFO_FILENAME}" "${TOOLCHAIN_INFO_DIR}"
-		touch "${FETCHED_FILES_DIR}/${TOOLCHAIN_INFO_FILENAME}.installed"
+		mkdir -p "${TOOLCHAIN_ENV_DIR}"
+		cp "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}" "${TOOLCHAIN_ENV_DIR}"
+		touch "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}.installed"
 		installed="yes"
 	fi
 
@@ -609,10 +609,10 @@ set_compilation_env() {
     path="$(realpath "${TOOLCHAIN_DIR}/bin")"
     ${PRINT_CMD} export PATH="${path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/google-cloud-sdk/bin"
 
-    if [[ -s "${TOOLCHAIN_INFO_DIR}/${TOOLCHAIN_INFO_FILENAME}" ]]; then
-        source "${TOOLCHAIN_INFO_DIR}/${TOOLCHAIN_INFO_FILENAME}"
+    if [[ -s "${TOOLCHAIN_ENV_DIR}/${TOOLCHAIN_ENV_FILENAME}" ]]; then
+        source "${TOOLCHAIN_ENV_DIR}/${TOOLCHAIN_ENV_FILENAME}"
     else
-        # To support COS build not having toolchain_info file
+        # To support COS build not having toolchain_env file
         CC="x86_64-cros-linux-gnu-gcc"
         CXX="x86_64-cros-linux-gnu-g++"
     fi
