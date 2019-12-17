@@ -15,7 +15,7 @@ set -o pipefail
 # Program name and version.  Bump the version number if you change
 # this script.
 readonly PROG_NAME="$(basename "${0}")"
-readonly PROG_VERSION="1.2"
+readonly PROG_VERSION="1.3"
 
 # ANSI escape sequences for pretty printing.
 readonly RED_S="\033[00;31m"
@@ -28,29 +28,54 @@ BUILD_ID=""
 readonly COS_OS_RELEASE="/media/root/etc/os-release"
 readonly COS_IMAGE_PROJECT="cos-cloud"
 
-# Kernel header, source, toolchain tarballs and toolchain_env file in COS public GCS bucket.
+# Public GCS bucket of COS to fetch files from.
 readonly COS_GCS_BUCKET="gs://cos-tools"
+
+# For each file to fetch, we have the following properties:
+#
+#      Property                                   Type
+#   1. Name in GCS bucket                         Fixed
+#   2. Install dir name relative to $INSTALL_DIR  Fixed
+#   3. Full pathname of install dir               Dynamic based on $INSTALL_DIR and $BUILD_ID
+#   4. Installation commnds                       Dynamic based on $INSTALL_DIR and $BUILS_ID
+#   5. Installation size in MB                    Fixed
+#
+# 1. Name in GCS bucket.
 readonly KERNEL_HEADERS="kernel-headers.tgz"
 readonly KERNEL_SRC="kernel-src.tar.gz"
 readonly TRUSTED_KEY="trusted_key.pem"
 readonly TOOLCHAIN="toolchain.tar.xz"
-readonly TOOLCHAIN_ENV_FILENAME="toolchain_env"
-readonly FILES_TO_FETCH=("${KERNEL_HEADERS}" "${KERNEL_SRC}" "${TRUSTED_KEY}" "${TOOLCHAIN}" "${TOOLCHAIN_ENV_FILENAME}")
-
-# Installation directory names.
-readonly FETCHED_FILES_DIRNAME="fetched-files"
+readonly TOOLCHAIN_ENV="toolchain_env"
+# 2. Install dir name relative to $INSTALL_DIR.
 readonly KERNEL_HEADERS_DIRNAME="cos-kernel-headers"
 readonly KERNEL_SRC_DIRNAME="cos-kernel-src"
+readonly TRUSTED_KEY_DIRNAME="${KERNEL_SRC_DIRNAME}"
 readonly TOOLCHAIN_DIRNAME="cos-toolchain"
 readonly TOOLCHAIN_ENV_DIRNAME="cos-toolchain-env"
-
-# Installation directory paths will be initialized after $INSTALL_DIR
-# and $BUILD_ID are set.
-FETCHED_FILES_DIR=""
+# 3. Full pathname of installation directories (see initialize()).
 KERNEL_HEADERS_DIR=""
 KERNEL_SRC_DIR=""
+TRUSTED_KEY_DIR=""
 TOOLCHAIN_DIR=""
 TOOLCHAIN_ENV_DIR=""
+# 4. Installation commnds (see initialize()).
+declare -A INSTALL_CMD
+INSTALL_CMD[${KERNEL_HEADERS}]=""
+INSTALL_CMD[${KERNEL_SRC}]=""
+INSTALL_CMD[${TRUSTED_KEY}]=""
+INSTALL_CMD[${TOOLCHAIN}]=""
+INSTALL_CMD[${TOOLCHAIN_ENV}]=""
+# 5. Installation size in MB.
+declare -A INSTALL_SIZE
+INSTALL_SIZE[${KERNEL_HEADERS}]="120"
+INSTALL_SIZE[${KERNEL_SRC}]="1000"
+INSTALL_SIZE[${TRUSTED_KEY}]="1"
+INSTALL_SIZE[${TOOLCHAIN}]="2200"
+INSTALL_SIZE[${TOOLCHAIN_ENV}]="1"
+
+readonly FILES_TO_FETCH=("${KERNEL_HEADERS}" "${KERNEL_SRC}" "${TRUSTED_KEY}" "${TOOLCHAIN}" "${TOOLCHAIN_ENV}")
+readonly FETCHED_FILES_DIRNAME="fetched-files"
+FETCHED_FILES_DIR=""
 
 # Temporary files created for the list subcommand.
 readonly TMP_IMAGE_LIST="/tmp/image_list"
@@ -62,30 +87,33 @@ CC=""
 CXX=""
 
 SUBCOMMAND=""
+NO_DISK_SPACE=false
 
 # Set the defaults that can be changed by command line flags.
 HELP=""			# -h
 INSTALL_DIR="${HOME}"	# -i
 ECHO=":"		# -v
 GLOBAL_OPTIONS="$(cat <<EOF
-	-h, --help	help message
+	-h, --help	print help message
 	-i, --instdir	install directory (default \$HOME: $HOME)
-	-v, --verbose	verbose mode
+	-v, --verbose	enable verbose mode
 EOF
 )"
 
 ALL=""			# -a
 LIST_OPTIONS="$(cat <<EOF
-	-h, --help	help message
+	-h, --help	print help message
 	-a, --all	include deprecated builds
 EOF
 )"
 
 # shellcheck disable=SC2034
-EXTRACT="yes"		# -x
+EXTRACT=true		# -x
+REMOVE=true		# -r
 FETCH_OPTIONS="$(cat <<EOF
-	-h, --help	help message
-	-x, --no-xtract	do not extract files
+	-h, --help	print help message
+	-r, --no-remove	do not remove fetched files after installation
+	-x, --no-xtract	do not extract files from their tarballs
 EOF
 )"
 
@@ -94,8 +122,8 @@ KERNEL_CONFIG=""	# -c
 PRINT_CMD=""		# -p
 MAKE_VERBOSE=""		# -V
 BUILD_OPTIONS="$(cat <<EOF
-	-h, --help	help message
-	-c, --kconf	path to kernel configuration file
+	-h, --help	print help message
+	-c, --kconf	specify path to kernel configuration file
 	-p, --print	print commands to build the kernel, but do not execute
 	-V		enable make's verbose mode
 EOF
@@ -103,14 +131,14 @@ EOF
 
 # shellcheck disable=SC2034
 REMOVE_OPTIONS="$(cat <<EOF
-	-h, --help	help message
-	-a, --all	remove all fetched files
+	-h, --help	print help message
+	-a, --all	remove all fetched and installed files
 EOF
 )"
 
 
 usage() {
-	local -r exit_code="${1}"
+	local -r exit_code="$1"
 
 	cat <<EOF
 ${PROG_NAME} v${PROG_VERSION}
@@ -143,6 +171,8 @@ ${REMOVE_OPTIONS}
 Environment:
 	HOME		default installation directory
 EOF
+
+	help_disk_space
 	exit "${exit_code}"
 }
 
@@ -172,7 +202,7 @@ main() {
 
 	case "${SUBCOMMAND}" in
 	"list")		subcmd_list;;
-	"fetch")	subcmd_fetch;;
+	"fetch")	subcmd_fetch; if "${EXTRACT}"; then extract_files; fi;;
 	"build")	subcmd_build;;
 	"remove")	subcmd_remove;;
 	*)		fatal internal error processing "${SUBCOMMAND}"
@@ -184,8 +214,8 @@ parse_args() {
 	local args
 
 	if ! args=$(getopt \
-			--options "ac:hi:pvVx" \
-			--longoptions "all config: help instdir: print verbose no-xtract" \
+			--options "ac:hi:prvVx" \
+			--longoptions "all config: help instdir: print no-remove verbose no-xtract" \
 			-- "$@"); then
 		# getopt has printed an appropriate error message.
 		exit 1
@@ -193,44 +223,46 @@ parse_args() {
 	eval set -- "${args}"
 
 	while [[ "${#}" -gt 0 ]]; do
-		case "${1}" in
+		case "$1" in
 		-a|--all)
 			ALL="yes";;
 		-c|--kconf)
 			shift
-			KERNEL_CONFIG="${1}";;
+			KERNEL_CONFIG="$1";;
 		-h|--help)
 			HELP="yes";;
 		-i|--instdir)
 			shift
-			INSTALL_DIR="${1}";;
+			INSTALL_DIR="$1";;
 		-p|--print)
 			PRINT_CMD="echo";;
+		-r|--no-remove)
+			REMOVE=false;;
 		-v|--verbose)
 			ECHO="info";;
 		-V)
 			MAKE_VERBOSE="V=1";;
 		-x|--no-xtract)
-			EXTRACT="no";;
+			EXTRACT=false;;
 		--)
 			;;
 		*)
-			if [[ ${1} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-				BUILD_ID="${1}"
+			if [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+				BUILD_ID="$1"
 				shift
 				continue
 			fi
 			if [[ -n "${SUBCOMMAND}" ]]; then
 				fatal specify only one subcommand
 			fi
-			case "${1}" in
-			"list")		SUBCOMMAND="${1}";;
-			"fetch")	SUBCOMMAND="${1}";;
-			"build")	SUBCOMMAND="${1}";;
-			"remove")	SUBCOMMAND="${1}";;
-			"help")		SUBCOMMAND="${1}";;
+			case "$1" in
+			"list")		SUBCOMMAND="$1";;
+			"fetch")	SUBCOMMAND="$1";;
+			"build")	SUBCOMMAND="$1";;
+			"remove")	SUBCOMMAND="$1";;
+			"help")		SUBCOMMAND="$1";;
 			"--")		;;
-			*)		fatal "${1}": invalid build id
+			*)		fatal "$1}": invalid build id
 			esac
 		esac
 		shift
@@ -263,10 +295,19 @@ initialize() {
 	fi
 
 	FETCHED_FILES_DIR="${INSTALL_DIR}/${FETCHED_FILES_DIRNAME}/${BUILD_ID}"
+
 	KERNEL_HEADERS_DIR="${INSTALL_DIR}/${KERNEL_HEADERS_DIRNAME}/${BUILD_ID}"
 	KERNEL_SRC_DIR="${INSTALL_DIR}/${KERNEL_SRC_DIRNAME}/${BUILD_ID}"
+	TRUSTED_KEY_DIR="${INSTALL_DIR}/${TRUSTED_KEY_DIRNAME}/${BUILD_ID}/certs"
 	TOOLCHAIN_DIR="${INSTALL_DIR}/${TOOLCHAIN_DIRNAME}/${BUILD_ID}"
 	TOOLCHAIN_ENV_DIR="${INSTALL_DIR}/${TOOLCHAIN_ENV_DIRNAME}/${BUILD_ID}"
+
+	INSTALL_CMD[${KERNEL_HEADERS}]="tar -C \"${KERNEL_HEADERS_DIR}\" -xf \"${FETCHED_FILES_DIR}/${KERNEL_HEADERS}\""
+	INSTALL_CMD[${KERNEL_SRC}]="tar -C \"${KERNEL_SRC_DIR}\" -xf \"${FETCHED_FILES_DIR}/${KERNEL_SRC}\" && \
+				    (cd \"$(dirname "${KERNEL_SRC_DIR}")\" && rm -f kernel && ln -s \"$(basename "${KERNEL_SRC_DIR}")\" kernel)"
+	INSTALL_CMD[${TRUSTED_KEY}]="cp -a \"${FETCHED_FILES_DIR}/${TRUSTED_KEY}\" \"${TRUSTED_KEY_DIR}/${TRUSTED_KEY}\""
+	INSTALL_CMD[${TOOLCHAIN}]="tar -C \"${TOOLCHAIN_DIR}\" -xf \"${FETCHED_FILES_DIR}/${TOOLCHAIN}\""
+	INSTALL_CMD[${TOOLCHAIN_ENV}]="cp \"${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV}\" \"${TOOLCHAIN_ENV_DIR}\""
 
 	info INSTALL_DIR="${INSTALL_DIR}"
 	info BUILD_ID="${BUILD_ID}"
@@ -274,6 +315,7 @@ initialize() {
 	"${ECHO}" FETCHED_FILES_DIR="${FETCHED_FILES_DIR}"
 	"${ECHO}" KERNEL_HEADERS_DIR="${KERNEL_HEADERS_DIR}"
 	"${ECHO}" KERNEL_SRC_DIR="${KERNEL_SRC_DIR}"
+	"${ECHO}" TRUSTED_KEY_DIR="${TRUSTED_KEY_DIR}"
 	"${ECHO}" TOOLCHAIN_DIR="${TOOLCHAIN_DIR}"
 	"${ECHO}" TOOLCHAIN_ENV_DIR="${TOOLCHAIN_ENV_DIR}"
 	"${ECHO}"
@@ -333,7 +375,7 @@ subcmd_list() {
 			if [[ ("${line}" == *"DEPRECATED"* || "${line}" == *"OBSOLETE"*) && -z "${ALL}" ]]; then
 				continue
 			fi
-			milestone_family=($(get_milestone_family "${line}"))
+			mapfile -t milestone_family < <(get_milestone_family "${line}")
 			printf "%-14s %2s %6s" "${build_id}" "${milestone_family[0]}" "${milestone_family[1]}"
 			if [[ -n "${ALL}" ]]; then
 				if [[ "${line}" == *"DEPRECATED"* ]]; then
@@ -365,53 +407,90 @@ subcmd_list() {
 
 
 subcmd_fetch() {
-	local f
+	local f		# file to fetch
+	local ff	# complete URL of the file to fetch
+	local fetched	# were any files fetched?
 	local md5	# md5sum checksum file
+	local bytes	# size of file to fetch in bytes
 
 	mkdir -p "${FETCHED_FILES_DIR}"
+	fetched=false
 	for f in "${FILES_TO_FETCH[@]}"; do
+		# To save disk space, fetched files are deleted by default (see -r) after being verified and installed.
+		if [[ -f "${FETCHED_FILES_DIR}/${f}.verified" && -f "${FETCHED_FILES_DIR}/${f}.installed" ]]; then
+			"${ECHO}" "${f}": already verified and installed
+			continue
+		fi
+		fetched=true
+
 		if [[ -s "${FETCHED_FILES_DIR}/${f}" ]]; then
-			"${ECHO}" "${FETCHED_FILES_DIR}/${f}" already exists
+			"${ECHO}" "${f}": already fetched
 		else
-			"${ECHO}" fetching "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
-			if ! fetch_file "${COS_GCS_BUCKET}/${BUILD_ID}/${f}" "${FETCHED_FILES_DIR}/${f}"; then
-				# Failing to fetch toolchain, toolchain_env or trusted key is not fatal
-				# because older build do not have them.
-				if [[ "${f}" != "${TOOLCHAIN}" && "${f}" != "${TRUSTED_KEY}" && "${f}" != "${TOOLCHAIN_ENV_FILENAME}" ]]; then
-					fatal could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+			ff="${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+			# Does the file to fetch exist in GCS?
+			if ! gsutil -q stat "${ff}" 2> /dev/null; then
+				# A non-existent trusted key, toolchain, or toolchain_env is not fatal
+				# because older releases do not have them.
+				if [[ "${f}" != "${TRUSTED_KEY}" && "${f}" != "${TOOLCHAIN}" && "${f}" != "${TOOLCHAIN_ENV}" ]]; then
+					fatal "${ff}" does not exists
 				fi
-				warn could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
-				rm -f "${COS_GCS_BUCKET}/${BUILD_ID}/${f}"
+				warn "${ff}" does not exist
+				continue
 			fi
+
+			# How big is the file to fetch?
+			bytes="$(gsutil stat "${ff}" 2> /dev/null | awk '/Content-Length:/ { print $2 }')"
+			if [[ -z "${bytes}" ]]; then
+				fatal cannot determine the size of "${ff}"
+			fi
+			# Do we have enough disk space for the file to fetch?
+			if ! have_disk_space $((bytes / (1024 * 1024))); then
+				fatal not enough disk space to fetch "${ff}"
+			fi
+
+			# Fetch the file.
+			"${ECHO}" fetching "${ff}"
+			if ! fetch_file "${ff}" "${FETCHED_FILES_DIR}/${f}"; then
+				fatal could not fetch "${ff}"
+				rm -f "${FETCHED_FILES_DIR}/${f}"
+			fi
+			# Remember that haven't verified or installed the file that we fetched.
 			rm -f "${FETCHED_FILES_DIR}/${f}.verified" "${FETCHED_FILES_DIR}/${f}.installed"
 		fi
 
+		# See if there's an md5sum file to verify the file we fetched.
 		md5="${f}.md5"
 		if [[ -s "${FETCHED_FILES_DIR}/${md5}" ]]; then
-			"${ECHO}" "${FETCHED_FILES_DIR}/${md5}" already exists
+			"${ECHO}" "${md5}": already fetched
 		else
-			"${ECHO}" fetching "${COS_GCS_BUCKET}/${BUILD_ID}/${md5}"
+			ff="${COS_GCS_BUCKET}/${BUILD_ID}/${md5}"
+			"${ECHO}" fetching "${ff}"
 			# The md5 file is missing for old builds, so we tolerate failure.
-			if ! fetch_file "${COS_GCS_BUCKET}/${BUILD_ID}/${md5}" "${FETCHED_FILES_DIR}/${md5}"; then
+			if ! fetch_file "${ff}" "${FETCHED_FILES_DIR}/${md5}"; then
 				# This error is not fatal because older tarballs do not have
 				# md5sum checksum files.
-				warn could not fetch "${COS_GCS_BUCKET}/${BUILD_ID}/${md5}"
+				warn could not fetch "${ff}"
 				rm -f "${FETCHED_FILES_DIR}/${md5}"
 			fi
 		fi
 	done
 
-	verify_fetched_files
-	if [[ "${EXTRACT}" == "yes" ]]; then
-		extract_files
+	if "${fetched}"; then
+		verify_fetched_files
 	fi
 }
 
 
 subcmd_build() {
 	subcmd_fetch
-	set_compilation_env
+	extract_files
 
+	# We need at least 2.4GB to build the kernel.
+	if ! have_disk_space 2400; then
+		fatal not enough disk space to build the kernel
+	fi
+
+	set_compilation_env
 	${PRINT_CMD} cd "${KERNEL_SRC_DIR}"
 	${PRINT_CMD} make ${MAKE_VERBOSE} -j $(($(nproc) * 2)) CROSS_COMPILE=x86_64-cros-linux-gnu- CC="${CC}" CXX="${CXX}"
 }
@@ -451,7 +530,7 @@ list_cos_images() {
 
 
 get_milestone_family() {
-	local line="${1}"
+	local line="$1"
 	local milestone
 	local family
 
@@ -472,8 +551,8 @@ get_milestone_family() {
 
 
 fetch_file() {
-	local src="${1}"
-	local dst="${2}"
+	local src="$1"
+	local dst="$2"
 
 	if ! gsutil cp "${src}" "${dst}" 2>/dev/null; then
 		return 1
@@ -486,25 +565,27 @@ fetch_file() {
 
 
 verify_fetched_files() {
+	local file
 	local f
 	local checksum
 
-	for f in "${FILES_TO_FETCH[@]}"; do
-		f="${FETCHED_FILES_DIR}/${f}"
-		if [[ ! -f "${f}.md5" ]]; then
-			warn no "${f}.md5", skipping verification
+	"${ECHO}"
+	for file in "${FILES_TO_FETCH[@]}"; do
+		f="${FETCHED_FILES_DIR}/${file}"
+		if [[ -f "${f}.verified" ]]; then
+			"${ECHO}" "${file}": already verified
 			continue
 		fi
-		if [[ -f "${f}.verified" ]]; then
-			"${ECHO}" "${f}": already verified
+		if [[ ! -f "${f}.md5" ]]; then
+			warn "${file}.md5" does not exist, skipping verification
 			continue
 		fi
 		checksum="$(md5sum "${f}" | awk '{ print $1 }')"
 		if [[ "${checksum}" == "$(cat "${f}.md5")" ]]; then
-			"${ECHO}" verified "${f}"
+			"${ECHO}" verified "${file}"
 			touch "${f}.verified"
 		else
-			fatal "${f}" md5sum mismatch: expected "$(cat "${f}.md5")", got "${checksum}"
+			fatal "${file}" md5sum mismatch: expected "$(cat "${f}.md5")", got "${checksum}"
 		fi
 	done
 }
@@ -512,51 +593,72 @@ verify_fetched_files() {
 
 extract_files() {
 	local f
-	local installed="no"
+	local installed=false
+
+	"${ECHO}"
+
+	for f in "${KERNEL_HEADERS}" "${KERNEL_SRC}" "${TOOLCHAIN}" "${TOOLCHAIN_ENV}"; do
+		if install "${f}"; then
+			installed=true
+		fi
+	done
+
+	if setup_kernel_config; then
+		installed=true
+	fi
+
+	setup_trusted_key
+
+	if "${installed}"; then
+		echo
+	fi
+}
+
+
+install() {
+	local f="$1"	# file that was fetched
+	local ff
+	local dir
+	local cmd
+
+	ff="${FETCHED_FILES_DIR}/${f}"
+	if [[ -f "${ff}.installed" ]]; then
+		"${ECHO}" "${ff}": already installed
+		return 1
+	fi
+
+	# Do we have enough disk space to install?
+	if ! have_disk_space "${INSTALL_SIZE["${f}"]}"; then
+		fatal not enough disk space to fetch "${ff}"
+	fi
+
+	info installing "${ff}"
+	case "${f}" in
+	"${KERNEL_HEADERS}") dir="${KERNEL_HEADERS_DIR}";;
+	"${KERNEL_SRC}") dir="${KERNEL_SRC_DIR}";;
+	"${TOOLCHAIN}") dir="${TOOLCHAIN_DIR}";;
+	"${TOOLCHAIN_ENV}") dir="${TOOLCHAIN_ENV_DIR}";;
+	*) fatal "don't know where to install ${f}";;
+	esac
+	mkdir -p "${dir}"
+	cmd="${INSTALL_CMD[${f}]:-none}"
+	if [[ "${cmd}" == "none" ]]; then
+		fatal "don't know how to install ${ff}"
+	fi
+	eval "${cmd}"
+	touch "${ff}.installed"
+	if "${REMOVE}"; then
+		rm "${ff}"
+	fi
+	return 0
+}
+
+
+setup_kernel_config() {
 	local kernel_config="${KERNEL_SRC_DIR}/.config"
+	local f
 
-	if [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN}.installed" ]]; then
-		"${ECHO}" toolchain already installed
-	else
-		info installing toolchain
-		mkdir -p "${TOOLCHAIN_DIR}"
-		tar -C "${TOOLCHAIN_DIR}" -xf "${FETCHED_FILES_DIR}/${TOOLCHAIN}"
-		touch "${FETCHED_FILES_DIR}/${TOOLCHAIN}.installed"
-		installed="yes"
-	fi
-
-	if [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}.installed" ]]; then
-		"${ECHO}" toolchain_env already installed
-	elif [[ -f "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}" ]]; then
-		info installing toolchain_env
-
-		mkdir -p "${TOOLCHAIN_ENV_DIR}"
-		cp "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}" "${TOOLCHAIN_ENV_DIR}"
-		touch "${FETCHED_FILES_DIR}/${TOOLCHAIN_ENV_FILENAME}.installed"
-		installed="yes"
-	fi
-
-	if [[ -f "${FETCHED_FILES_DIR}/${KERNEL_HEADERS}.installed" ]]; then
-		"${ECHO}" kernel headers already installed
-	else
-		info installing kernel headers
-		mkdir -p "${KERNEL_HEADERS_DIR}"
-		tar -C "${KERNEL_HEADERS_DIR}" -xf "${FETCHED_FILES_DIR}/${KERNEL_HEADERS}"
-		touch "${FETCHED_FILES_DIR}/${KERNEL_HEADERS}.installed"
-		installed="yes"
-	fi
-
-	if [[ -f "${FETCHED_FILES_DIR}/${KERNEL_SRC}.installed" ]]; then
-		"${ECHO}" kernel source already installed
-	else
-		info installing kernel source
-		mkdir -p "${KERNEL_SRC_DIR}"
-		tar -C "${KERNEL_SRC_DIR}" -xf "${FETCHED_FILES_DIR}/${KERNEL_SRC}"
-		(cd "$(dirname "${KERNEL_SRC_DIR}")" && rm -f kernel && ln -s "$(basename "${KERNEL_SRC_DIR}")" kernel)
-		touch "${FETCHED_FILES_DIR}/${KERNEL_SRC}.installed"
-		installed="yes"
-	fi
-
+	# Was kernel configuration file specified on the command line?
 	if [[ -n "${KERNEL_CONFIG}" ]]; then
 		info creating kernel config file from "${KERNEL_CONFIG}"
 		if [[ "${KERNEL_CONFIG}" == "/proc/config.gz" ]]; then
@@ -564,58 +666,123 @@ extract_files() {
 		else
 			cp -a "${KERNEL_CONFIG}" "${KERNEL_SRC_DIR}"
 		fi
-		installed="yes"
-	else
-		if [[ -s "${kernel_config}" ]]; then
-			"${ECHO}" "${kernel_config}" already exists
-		else
-			info copying kernel config from kernel headers
-			f="$(eval echo "${KERNEL_HEADERS_DIR}"/usr/src/linux-headers-*/.config)"
-			if [[ ! -f "${f}" ]]; then
-				fatal "${f}" does not exist
-			fi
-			cp -a "${f}" "${kernel_config}"
-			installed="yes"
-		fi
+		return 0
 	fi
 
-	# Check if we fetched a trusted key and need to copy it to kernel source directory.
+	if [[ -s "${kernel_config}" ]]; then
+		"${ECHO}" "${kernel_config}": already exists
+		return 1
+	fi
+
+	info copying kernel config from kernel headers
+	f="$(eval echo "${KERNEL_HEADERS_DIR}"/usr/src/linux-headers-*/.config)"
+	if [[ ! -f "${f}" ]]; then
+		fatal "${f}" does not exist
+	fi
+	cp -a "${f}" "${kernel_config}"
+	return 0
+}
+
+
+setup_trusted_key() {
+	local kernel_config="${KERNEL_SRC_DIR}/.config"
+	local output
+	local cmd
+
+	# Check CONFIG_SYSTEM_TRUSTED_KEYS to see if we have to copy the trusted key
+	# to the kernel source directory.
 	output="$(grep -w "CONFIG_SYSTEM_TRUSTED_KEYS" "${kernel_config}")" || true
-	if echo "${output}" | grep -qw "certs/${TRUSTED_KEY}"; then
-		if [[ -f "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" ]]; then
-			if [[ ! -f "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}" ]]; then
-				info copying trusted key to "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
-				cp -a "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}"
-				installed="yes"
-			else
-				"${ECHO}" trusted key "${KERNEL_SRC_DIR}/certs/${TRUSTED_KEY}" already exists
-			fi
-		else
-			warn modifying trusted key kernel config option because we could not fetch the trusted key
-			sed -i.bak -e 's/CONFIG_SYSTEM_TRUSTED_KEYS=.*/CONFIG_SYSTEM_TRUSTED_KEYS=""/' "${kernel_config}"
-			diff "${kernel_config}" "${kernel_config}.bak" || true
-		fi
+	if [[ -z "${output}" ]]; then
+		warn CONFIG_SYSTEM_TRUSTED_KEYS not in "${kernel_config}"
+		return
+	fi
+	if ! echo "${output}" | grep -qw "certs/${TRUSTED_KEY}"; then
+		return
 	fi
 
-	if [[ "${installed}" == "yes" ]]; then
-		echo
+	# Did we fetch the trusted key?
+	if [[ -f "${FETCHED_FILES_DIR}/${TRUSTED_KEY}" ]]; then
+		if [[ -f "${TRUSTED_KEY_DIR}/${TRUSTED_KEY}" ]]; then
+			"${ECHO}" trusted key "${TRUSTED_KEY_DIR}/${TRUSTED_KEY}": already exists
+			return
+		fi
+
+		info copying trusted key to "${TRUSTED_KEY_DIR}/${TRUSTED_KEY}"
+		cmd="${INSTALL_CMD[${TRUSTED_KEY}]:-none}"
+		if [[ "${cmd}" == "none" ]]; then
+			fatal "don't know how to install ${TRUSTED_KEY}"
+		fi
+		eval "${cmd}"
+	else
+		warn "modifying CONFIG_SYSTEM_TRUSTED_KEYS's value because we could not fetch the trusted key"
+		sed -i.bak -e 's/CONFIG_SYSTEM_TRUSTED_KEYS=.*/CONFIG_SYSTEM_TRUSTED_KEYS=""/' "${kernel_config}"
+		echo diff "${kernel_config}" "${kernel_config}.bak"
+		diff "${kernel_config}" "${kernel_config}.bak" || true
 	fi
 }
 
 
 set_compilation_env() {
-    local path
+	local path
 
-    path="$(realpath "${TOOLCHAIN_DIR}/bin")"
-    ${PRINT_CMD} export PATH="${path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/google-cloud-sdk/bin"
+	path="$(realpath "${TOOLCHAIN_DIR}/bin")"
+	${PRINT_CMD} export PATH="${path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/google-cloud-sdk/bin"
 
-    if [[ -s "${TOOLCHAIN_ENV_DIR}/${TOOLCHAIN_ENV_FILENAME}" ]]; then
-        source "${TOOLCHAIN_ENV_DIR}/${TOOLCHAIN_ENV_FILENAME}"
-    else
-        # To support COS build not having toolchain_env file
-        CC="x86_64-cros-linux-gnu-gcc"
-        CXX="x86_64-cros-linux-gnu-g++"
-    fi
+	if [[ -s "${TOOLCHAIN_ENV_DIR}/${TOOLCHAIN_ENV}" ]]; then
+		# shellcheck disable=SC1090
+		source "${TOOLCHAIN_ENV_DIR}/${TOOLCHAIN_ENV}"
+	else
+		# To support COS build not having toolchain_env file
+		CC="x86_64-cros-linux-gnu-gcc"
+		CXX="x86_64-cros-linux-gnu-g++"
+	fi
+}
+
+
+have_disk_space() {
+	local need="$1"
+	local avail
+
+	avail="$(df -BM --output=avail "${INSTALL_DIR}" | sed -n -e 's/M//p')"
+	if [[ "${avail}" -lt "${need}" ]]; then
+		error need at least "${need}"MB, but have only "${avail}"MB in "${INSTALL_DIR}"
+		NO_DISK_SPACE=true
+		return 1
+	fi
+	return 0
+}
+
+
+help_disk_space() {
+cat <<'END'
+
+NOTE:
+Because by default toolbox uses /var/lib/toolbox as its working directory,
+you can run out of space if your root partition is not big enough.
+
+You can add a second drive to your COS instance and use it as the working
+directory of toolbox.  For example, the following code creates a second
+disk, attaches it to the instance, uses cloud-init to mount it on each
+reboot, and assigns it to toolbox:
+
+	# On your desktop:
+	$ gcloud compute disks create <your-disk> --size=200GB
+	$ gcloud compute instances attach-disk <your-instance> --disk <your-disk>
+	$ cat > user_data <<EOF
+	#cloud-config
+
+	bootcmd:
+	- if [ -z "$(sudo blkid /dev/sdb)" ]; then mkfs.ext4 /dev/sdb; fi
+	- fsck.ext4 /dev/sdb
+	- mkdir -p /mnt/disks/sdb
+	- mount -t ext4 /dev/sdb /mnt/disks/sdb
+	EOF
+	$ gcloud compute instances add-metadata <your-instance> --metadata-from-file=user-data=user_data
+
+	# On your COS instance:
+	$ echo TOOLBOX_DIRECTORY="/mnt/disks/sdb" >> $HOME/.toolboxrc
+	$ sudo reboot
+END
 }
 
 
@@ -642,6 +809,9 @@ error() {
 
 fatal() {
 	error "${@}"
+	if ${NO_DISK_SPACE}; then
+		help_disk_space
+	fi
 	exit 1
 }
 
