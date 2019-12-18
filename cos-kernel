@@ -107,7 +107,6 @@ LIST_OPTIONS="$(cat <<EOF
 EOF
 )"
 
-# shellcheck disable=SC2034
 EXTRACT=true		# -x
 REMOVE=true		# -r
 FETCH_OPTIONS="$(cat <<EOF
@@ -117,7 +116,6 @@ FETCH_OPTIONS="$(cat <<EOF
 EOF
 )"
 
-# shellcheck disable=SC2034
 KERNEL_CONFIG=""	# -c
 PRINT_CMD=""		# -p
 MAKE_VERBOSE=""		# -V
@@ -129,7 +127,6 @@ BUILD_OPTIONS="$(cat <<EOF
 EOF
 )"
 
-# shellcheck disable=SC2034
 REMOVE_OPTIONS="$(cat <<EOF
 	-h, --help	print help message
 	-a, --all	remove all fetched and installed files
@@ -502,8 +499,7 @@ subcmd_remove() {
 	if [[ -n "${ALL}" ]]; then
 		for f in "${FETCHED_FILES_DIRNAME}" "${KERNEL_HEADERS_DIRNAME}" "${KERNEL_SRC_DIRNAME}" "${TOOLCHAIN_DIRNAME}" "${TOOLCHAIN_ENV_DIRNAME}"; do
 			info removing "${INSTALL_DIR}/${f}"
-			# shellcheck disable=SC2115
-			rm -rf "${INSTALL_DIR}/${f}"
+			rm -rf "${INSTALL_DIR:?INSTALL_DIR not set}/${f}"
 		done
 		return
 	fi
