@@ -26,7 +26,7 @@ RUN apt-get install -u -qq vim \
 RUN apt-get update && \
     apt-get install -u -qq \
         xz-utils make gcc python-minimal bc libelf-dev libssl-dev \
-        crash bison flex && \
+        crash bison flex dwarves libdw1 && \
     apt-get clean
 COPY cos-kernel /usr/local/bin
 

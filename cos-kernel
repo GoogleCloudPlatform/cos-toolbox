@@ -489,7 +489,7 @@ subcmd_build() {
 
 	set_compilation_env
 	${PRINT_CMD} cd "${KERNEL_SRC_DIR}"
-	${PRINT_CMD} make ${MAKE_VERBOSE} -j $(($(nproc) * 2)) CROSS_COMPILE=x86_64-cros-linux-gnu- CC="${CC}" CXX="${CXX}"
+	${PRINT_CMD} make ${MAKE_VERBOSE} -j $(($(nproc) * 2))  CC="${CC}" CXX="${CXX}"
 }
 
 
