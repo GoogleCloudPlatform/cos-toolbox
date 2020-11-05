@@ -1,5 +1,5 @@
-# Start from debian:stretch-backports base.
-FROM debian:stretch-backports
+# Start from debian:buster-backports base.
+FROM debian:buster-backports
 
 # Prepare the image.
 ENV DEBIAN_FRONTEND noninteractive
