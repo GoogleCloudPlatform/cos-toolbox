@@ -175,6 +175,8 @@ EOF
 
 
 main() {
+	check_arch
+
 	local options
 
 	parse_args "${@}"
@@ -206,6 +208,13 @@ main() {
 	esac
 }
 
+check_arch() {
+	arch=$(uname -m)
+	if  [ $arch == "arm64" ] || [ $arch == "aarch64" ]; then
+		echo "cos-kernel not supported on ARM"
+		exit 1
+	fi
+}
 
 parse_args() {
 	local args

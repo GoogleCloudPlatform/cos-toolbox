@@ -1,20 +1,28 @@
+FROM golang:1.11 as gcr-build
+
+RUN go get -u github.com/GoogleCloudPlatform/docker-credential-gcr
+
 # Start from debian:buster-backports base.
 FROM debian:buster-backports
 
 # Prepare the image.
 ENV DEBIAN_FRONTEND noninteractive
 
-# These instructions are derieved from the google/cloud-sdk docker image
-# (https://github.com/GoogleCloudPlatform/cloud-sdk-docker/blob/master/Dockerfile)
-# To keep the image size small, we install only the most
-# needed components of gcloud & their dependencies.
-RUN apt-get update && apt-get install -y -qq --no-install-recommends wget curl unzip python openssh-client python-openssl ca-certificates && apt-get clean
+COPY --from=gcr-build /go/bin/docker-credential-gcr /usr/bin/
+
+# Google Cloud SDK pre requisites.
+RUN apt-get update && apt-get install -y -qq --no-install-recommends apt-transport-https \
+    ca-certificates gnupg curl
 
 # Install the Google Cloud SDK.
 ENV HOME /
 ENV CLOUDSDK_PYTHON_SITEPACKAGES 1
-RUN wget https://dl.google.com/dl/cloudsdk/channels/rapid/google-cloud-sdk.zip && unzip google-cloud-sdk.zip && rm google-cloud-sdk.zip && \
-    google-cloud-sdk/install.sh --usage-reporting=true --path-update=true --bash-completion=true --rc-path=/.bashrc --additional-components alpha beta docker-credential-gcr
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+    https://packages.cloud.google.com/apt cloud-sdk main" | \
+    tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+    apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - \
+    && apt-get update && apt-get -y -qq install google-cloud-sdk && apt-get clean
 
 # Various networking and other tools. net-tools installs arp, netstat, etc.
 RUN apt-get install -u -qq vim \
@@ -30,8 +38,6 @@ RUN apt-get update && \
     apt-get clean
 COPY cos-kernel /usr/local/bin
 
-RUN mkdir /.ssh && echo "PATH=\$PATH:/google-cloud-sdk/bin" > /etc/profile.d/gcloud_path.sh
-ENV PATH /google-cloud-sdk/bin:$PATH
 VOLUME ["/.config"]
 
 CMD ["/bin/bash"]
