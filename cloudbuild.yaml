@@ -1,0 +1,24 @@
+options:
+  env:
+  - 'DOCKER_CLI_EXPERIMENTAL=enabled'
+steps:
+# Build toolbox image
+# This step is needed to add a new entry to /proc/sys/fs/binfmt_misc. Docker
+# uses QEMU user emulation to run arm64 programs on x86 hosts. A QEMU
+# interpreter needs to be added to /proc/sys/fs/binfmt_misc to run arm64
+# programs.
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['run', '--privileged', 'linuxkit/binfmt:v0.7']
+# The default builder (which appears to be the Docker daemon that implements
+# the old, familiar `docker build` behavior) doesn't support the --platform
+# flag, so we need to create a new builder.
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['buildx', 'create', '--name', 'builder']
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['buildx', 'use', 'builder']
+# Images produced in this way do not appear in the Docker image registry shown
+# by `docker images`, at least by default. We use the --push flag to push the
+# image after building it, because a subsequent `docker push` won't find the
+# image locally.
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['buildx', 'build', '--platform', 'linux/amd64,linux/arm64', '-t', 'gcr.io/${_OUTPUT_PROJECT}/toolbox:latest', '-t', 'gcr.io/${_OUTPUT_PROJECT}/toolbox:${TAG_NAME}', '--push', '.']
