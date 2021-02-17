@@ -9,8 +9,7 @@ This is a Docker image used by the
 OS](https://cloud.google.com/container-optimized-os/). This image comes
 pre-installed with common debugging tools that are not pre-installed on the host.
 
-The official toolbox container is available at `gcr.io/google-containers/toolbox`.
-Current tag: `20190312-00`
+The official toolbox container is available at `gcr.io/cos-cloud/toolbox`.
 
 Starting with tag `20190312-00`, COS toolbox includes a tool called
 `cos-kernel` to make it easy to fetch kernel headers, source, and
@@ -49,3 +48,12 @@ root@my-cos-instance:~# cos-kernel help
 
 For detailed documentation on how this is used, see
 https://cloud.google.com/container-optimized-os/docs/how-to/toolbox.
+
+
+# Contributor Docs
+
+## Releasing
+
+To release a new version of COS Toolbox, tag the commit you want to release
+with the date in the form of `vYYYYMMDD`. This will trigger a Cloud Build job to
+build and release the container image.
