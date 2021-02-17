@@ -22,3 +22,4 @@ steps:
 # image locally.
 - name: 'gcr.io/cloud-builders/docker'
   args: ['buildx', 'build', '--platform', 'linux/amd64,linux/arm64', '-t', 'gcr.io/${_OUTPUT_PROJECT}/toolbox:latest', '-t', 'gcr.io/${_OUTPUT_PROJECT}/toolbox:${TAG_NAME}', '--push', '.']
+timeout: 1800s
