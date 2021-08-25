@@ -1,3 +1,6 @@
+# [ARCHIVED repository] Toolbox has relocated to https://cos.googlesource.com/cos/tools.
+## This Git repository is archived and is now read-only.
+
 # Toolbox Docker Container for Container-Optimized OS
 
 Note: This is not an official Google product.
